@@ -36,11 +36,16 @@ srpm_name=$1
 output_dir=${2:-srpm-scan-artifacts}
 
 case "$srpm_name" in
-  ''|.|..|*/*)
+  ''|.|..|*/*|*\\*)
     echo "SRPM_NAME must be a file name without path components: $srpm_name" >&2
     exit 2
     ;;
 esac
+
+if [[ "$srpm_name" =~ [[:cntrl:]] ]]; then
+  echo "SRPM_NAME must not contain control characters" >&2
+  exit 2
+fi
 
 if [[ "$srpm_name" != *.src.rpm ]]; then
   echo "SRPM_NAME must end with .src.rpm: $srpm_name" >&2
@@ -52,6 +57,23 @@ fi
 : "${CSMOCK_IMAGE:?CSMOCK_IMAGE is required}"
 : "${MOCK_CONFIG:?MOCK_CONFIG is required}"
 
+if [[ "$CSMOCK_IMAGE" == -* || "$CSMOCK_IMAGE" =~ [[:cntrl:]] ]]; then
+  echo "CSMOCK_IMAGE must be an image reference, not a Docker option or control sequence" >&2
+  exit 2
+fi
+
+if [[ "$MOCK_CONFIG" == -* || "$MOCK_CONFIG" =~ [[:cntrl:]] ]]; then
+  echo "MOCK_CONFIG must be a single profile value, not an option or control sequence" >&2
+  exit 2
+fi
+
+# Plugin identifiers form a comma-separated list, not additional shell options.
+# Do not hardcode the available plugins; custom identifiers remain supported.
+if [[ -n "${CSMOCK_TOOLS:-}" && ! "$CSMOCK_TOOLS" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*(,[a-zA-Z0-9_][a-zA-Z0-9_.-]*)*$ ]]; then
+  echo "CSMOCK_TOOLS must be a comma-separated list of plugin identifiers" >&2
+  exit 2
+fi
+
 agent_workdir="${JENKINS_AGENT_WORKDIR:-/home/jenkins/agent}"
 input_container_dir="/scan-input"
 
@@ -61,7 +83,7 @@ input_container="$input_container_dir/$srpm_name"
 input_host="$SRPM_SCAN_INPUT_HOST_PATH/$srpm_name"
 
 # 输出目录：容器内路径 -> 宿主机路径
-abs_output=$(realpath -m "$output_dir")
+abs_output=$(realpath -m -- "$output_dir")
 case "$abs_output" in
   "$agent_workdir"/*)
     relative_output="${abs_output#"$agent_workdir"/}"
@@ -90,9 +112,19 @@ run_cmd=(
   -v "$SRPM_SCAN_INPUT_HOST_PATH:/input:ro"
   -v "$SRPM_SCAN_AGENT_WORKSPACE_HOST_PATH:/output"
   "$CSMOCK_IMAGE"
-  sh -c "set -e
-    csmock -r '$MOCK_CONFIG' ${csmock_tools_opt[*]:-} --force -o '$container_output/$nvr.tar.xz' '/input/$srpm_name'
-    sudo chown -R $(id -u):$(id -g) '$container_output'"
+  # Only static code belongs in sh -c. All scan values cross this boundary as
+  # positional arguments, so quotes and substitutions in them stay literal.
+  sh -eu -c '
+    mock_config=$1
+    archive_path=$2
+    input_srpm=$3
+    output_directory=$4
+    owner=$5
+    shift 5
+    csmock -r "$mock_config" "$@" --force -o "$archive_path" "$input_srpm"
+    sudo chown -R "$owner" -- "$output_directory"
+  ' run-srpm-scan "$MOCK_CONFIG" "$container_output/$nvr.tar.xz" \
+    "/input/$srpm_name" "$container_output" "$(id -u):$(id -g)" "${csmock_tools_opt[@]}"
 )
 
 if [[ "$dry_run" == "1" ]]; then
