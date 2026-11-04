@@ -1,5 +1,6 @@
 """Run in an isolated agent container; Docker and scanner commands are stubs."""
 
+import csv
 import json
 import os
 from pathlib import Path
@@ -66,6 +67,7 @@ class RunSrpmScanTests(unittest.TestCase):
             **os.environ,
             "PATH": f"{self.fakebin}:{os.environ['PATH']}",
             "JENKINS_AGENT_WORKDIR": str(self.root / "agent"),
+            "WORKSPACE": str(self.workdir),
             "SRPM_SCAN_INPUT_HOST_PATH": "/host/input with spaces",
             "SRPM_SCAN_AGENT_WORKSPACE_HOST_PATH": "/host/agent workspace",
             "CSMOCK_IMAGE": "test-csmock:fixed",
@@ -93,15 +95,25 @@ class RunSrpmScanTests(unittest.TestCase):
     def read_args(self, command):
         return json.loads((self.root / f"{command}.json").read_text())
 
+    def bind_mounts(self):
+        args = self.read_args("docker")
+        self.assertNotIn("-v", args, "bind sources must not be created silently by Docker")
+        result = []
+        for index, arg in enumerate(args):
+            if arg == "--mount":
+                fields = next(csv.reader([args[index + 1]]))
+                result.append(dict(field.split("=", 1) if "=" in field else (field, True) for field in fields))
+        self.assertEqual(len(result), 2)
+        return result
+
     def assert_no_injection(self):
         self.assertFalse((self.workdir / "PROBE").exists(), "untrusted text ran as shell code")
 
     def assert_scan_args(self, name, output="artifacts", config=None, tools="cppcheck,clang,gcc,shellcheck"):
-        relative = (self.workdir / output).relative_to(self.root / "agent")
         expected = ["-r", config or self.env["MOCK_CONFIG"]]
         if tools:
             expected += ["-t", tools]
-        expected += ["--force", "-o", f"/output/{relative}/{name[:-8]}.tar.xz", f"/input/{name}"]
+        expected += ["--force", "-o", f"/output/{name[:-8]}.tar.xz", f"/input/{name}"]
         self.assertEqual(self.read_args("csmock"), expected)
 
     def test_normal_scan_preserves_arguments_and_ownership(self):
@@ -110,7 +122,7 @@ class RunSrpmScanTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_scan_args(name)
         self.assertEqual(self.read_args("sudo"), [
-            "chown", "-R", f"{os.getuid()}:{os.getgid()}", "--", "/output/workspace/scan job/artifacts",
+            "chown", "-R", f"{os.getuid()}:{os.getgid()}", "--", "/output",
         ])
 
     def test_filename_shell_metacharacters_remain_literal(self):
@@ -222,6 +234,116 @@ class RunSrpmScanTests(unittest.TestCase):
         self.assert_no_injection()
         self.assertEqual(replay.returncode, 0, replay.stderr)
         self.assert_scan_args(name)
+
+    def test_only_current_input_and_output_are_bound(self):
+        name = "curl-8.4.0-9.ocs23.src.rpm"
+        result = self.invoke(name)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.bind_mounts(), [
+            {"type": "bind", "source": f"/host/input with spaces/{name}",
+             "target": f"/input/{name}", "readonly": True},
+            {"type": "bind", "source": "/host/agent workspace/workspace/scan job/artifacts",
+             "target": "/output"},
+        ])
+        self.assertIn("/host/agent workspace/workspace/scan job/artifacts/", result.stdout)
+
+    def test_mount_paths_preserve_commas_quotes_and_colons(self):
+        name = 'curl,"quoted":next.src.rpm'
+        host_input = '/host/input,"quoted":data'
+        host_workspace = '/host/agent,"quoted":data'
+        result = self.invoke(name, output='output,"quoted":data',
+                             SRPM_SCAN_INPUT_HOST_PATH=host_input,
+                             SRPM_SCAN_AGENT_WORKSPACE_HOST_PATH=host_workspace)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        mounts = self.bind_mounts()
+        self.assertEqual(mounts[0]["source"], f"{host_input}/{name}")
+        self.assertEqual(mounts[0]["target"], f"/input/{name}")
+        self.assertEqual(mounts[1]["source"], f'{host_workspace}/workspace/scan job/output,"quoted":data')
+
+    def test_commas_in_paths_cannot_add_mount_options(self):
+        name = "curl,readonly=false.src.rpm"
+        result = self.invoke(name, output="output,target=elsewhere",
+                             SRPM_SCAN_INPUT_HOST_PATH="/host/input,readonly=false,target=/etc")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        mounts = self.bind_mounts()
+        self.assertEqual(set(mounts[0]), {"type", "source", "target", "readonly"})
+        self.assertIs(mounts[0]["readonly"], True)
+        self.assertEqual(mounts[0]["target"], f"/input/{name}")
+        self.assertEqual(mounts[1]["target"], "/output")
+
+    def test_unset_workspace_falls_back_to_current_directory(self):
+        result = self.invoke(WORKSPACE="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.bind_mounts()[1]["source"],
+                         "/host/agent workspace/workspace/scan job/artifacts")
+
+    def test_workspace_cannot_escape_agent_root(self):
+        result = self.invoke(WORKSPACE=str(self.root / "outside"))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse((self.root / "docker.json").exists())
+
+    def test_control_characters_in_output_path_are_rejected(self):
+        result = self.invoke(output="artifacts\nother")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse((self.root / "docker.json").exists())
+
+    def test_output_cannot_be_another_jobs_directory(self):
+        outside = self.root / "agent" / "workspace" / "other job" / "artifacts"
+        result = self.invoke(output=str(outside))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse((self.root / "docker.json").exists())
+        self.assertFalse(outside.exists())
+
+    def test_entire_current_workspace_cannot_be_the_output(self):
+        result = self.invoke(output=".")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse((self.root / "docker.json").exists())
+
+    def test_output_symlink_cannot_escape_current_workspace(self):
+        outside = self.root / "agent" / "workspace" / "other job"
+        outside.mkdir()
+        (self.workdir / "link").symlink_to(outside, target_is_directory=True)
+        result = self.invoke(output="link/artifacts")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse((self.root / "docker.json").exists())
+        self.assertFalse((outside / "artifacts").exists())
+
+    def test_input_symlink_is_rejected(self):
+        outside = self.root / "outside.src.rpm"
+        outside.write_bytes(b"unrelated file")
+        link = Path("/scan-input/curl-link.src.rpm")
+        link.symlink_to(outside)
+        self.addCleanup(link.unlink, missing_ok=True)
+        result = self.invoke(link.name, input_exists=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse((self.root / "docker.json").exists())
+
+    def test_input_must_be_a_regular_file(self):
+        directory = Path("/scan-input/not-a-file.src.rpm")
+        directory.mkdir()
+        self.addCleanup(directory.rmdir)
+        result = self.invoke(directory.name, input_exists=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse((self.root / "docker.json").exists())
+
+    def test_invalid_host_roots_are_rejected(self):
+        for field in ("SRPM_SCAN_INPUT_HOST_PATH", "SRPM_SCAN_AGENT_WORKSPACE_HOST_PATH"):
+            for value in ("relative", "/", "///", "/host/../data", "/host\ndata"):
+                with self.subTest(field=field, value=value):
+                    result = self.invoke(**{field: value})
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertFalse((self.root / "docker.json").exists())
+
+    def test_independent_outputs_have_independent_writable_mounts(self):
+        first = self.invoke(output="artifacts/first")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        first_source = self.bind_mounts()[1]["source"]
+        second = self.invoke(output="artifacts/second")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        second_source = self.bind_mounts()[1]["source"]
+        self.assertEqual(first_source, "/host/agent workspace/workspace/scan job/artifacts/first")
+        self.assertEqual(second_source, "/host/agent workspace/workspace/scan job/artifacts/second")
+        self.assertNotEqual(first_source, second_source)
 
 
 if __name__ == "__main__":

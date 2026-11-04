@@ -11,7 +11,7 @@
 # 用法：
 #   run-srpm-scan SRPM_NAME [OUTPUT_DIR]
 #     SRPM_NAME   待扫描的 .src.rpm 文件名
-#     OUTPUT_DIR  相对 agent 工作目录的输出目录，默认 srpm-scan-artifacts
+#     OUTPUT_DIR  当前 Jenkins 工作区内的输出子目录，默认 srpm-scan-artifacts
 #   run-srpm-scan --dry-run SRPM_NAME [OUTPUT_DIR]
 #     只打印将要执行的 docker 命令，不做任何实际操作
 #
@@ -74,27 +74,71 @@ if [[ -n "${CSMOCK_TOOLS:-}" && ! "$CSMOCK_TOOLS" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]
   exit 2
 fi
 
-agent_workdir="${JENKINS_AGENT_WORKDIR:-/home/jenkins/agent}"
+for host_path in "$SRPM_SCAN_INPUT_HOST_PATH" "$SRPM_SCAN_AGENT_WORKSPACE_HOST_PATH"; do
+  if [[ "$host_path" != /* || "$host_path" =~ ^/+$ || "$host_path" =~ (^|/)\.\.?(/|$) || "$host_path" =~ [[:cntrl:]] ]]; then
+    echo "宿主挂载根必须为无路径跳转或控制字符的绝对目录，不能是根目录" >&2
+    exit 2
+  fi
+done
+
+agent_workdir=$(realpath -m -- "${JENKINS_AGENT_WORKDIR:-/home/jenkins/agent}")
+workspace=$(realpath -m -- "${WORKSPACE:-$PWD}")
+case "$workspace" in
+  "$agent_workdir"|"$agent_workdir"/*) ;;
+  *)
+    echo "当前 Jenkins 工作区必须位于 agent 工作目录 $agent_workdir 内" >&2
+    exit 2
+    ;;
+esac
 input_container_dir="/scan-input"
 
 nvr=${srpm_name%.src.rpm}
-# 传给 docker -v 的是宿主路径；脚本自己访问文件则用容器内路径
+# Docker daemon 读取宿主路径；脚本自己访问文件则用容器内路径。
 input_container="$input_container_dir/$srpm_name"
 input_host="$SRPM_SCAN_INPUT_HOST_PATH/$srpm_name"
 
 # 输出目录：容器内路径 -> 宿主机路径
+if [[ "$output_dir" =~ [[:cntrl:]] ]]; then
+  echo "输出目录不能包含控制字符" >&2
+  exit 2
+fi
 abs_output=$(realpath -m -- "$output_dir")
 case "$abs_output" in
-  "$agent_workdir"/*)
+  "$workspace"/*)
     relative_output="${abs_output#"$agent_workdir"/}"
     ;;
   *)
-    echo "输出目录必须位于 agent 工作目录 $agent_workdir 内：$output_dir" >&2
+    echo "输出目录必须为当前 Jenkins 工作区 $workspace 内的子目录：$output_dir" >&2
     exit 2
     ;;
 esac
 host_output="$SRPM_SCAN_AGENT_WORKSPACE_HOST_PATH/$relative_output"
-container_output="/output/$relative_output"
+container_output="/output"
+
+if [[ -L "$input_container" ]]; then
+  echo "待扫描 SRPM 不能是符号链接：$input_container" >&2
+  exit 2
+fi
+if [[ "$dry_run" != "1" && ( ! -f "$input_container" || ! -s "$input_container" ) ]]; then
+  echo "找不到非空的常规 SRPM 文件：$input_container（宿主机目录 $SRPM_SCAN_INPUT_HOST_PATH）" >&2
+  exit 2
+fi
+
+bind_spec() {
+  # --mount fails on missing sources, unlike -v. CSV encoding preserves path
+  # commas/quotes without letting them add mount options or change the target.
+  python3 - "$@" <<'PY'
+import csv
+import sys
+
+csv.writer(sys.stdout, lineterminator="").writerow([
+    "type=bind", f"source={sys.argv[1]}", f"target={sys.argv[2]}", *sys.argv[3:],
+])
+PY
+}
+
+input_mount=$(bind_spec "$input_host" "/input/$srpm_name" readonly)
+output_mount=$(bind_spec "$host_output" "$container_output")
 
 csmock_tools_opt=()
 if [[ -n "${CSMOCK_TOOLS:-}" ]]; then
@@ -109,8 +153,8 @@ run_cmd=(
   --name "$container_name"
   --cap-add=SYS_ADMIN
   --group-add "$(id -g)"
-  -v "$SRPM_SCAN_INPUT_HOST_PATH:/input:ro"
-  -v "$SRPM_SCAN_AGENT_WORKSPACE_HOST_PATH:/output"
+  --mount "$input_mount"
+  --mount "$output_mount"
   "$CSMOCK_IMAGE"
   # Only static code belongs in sh -c. All scan values cross this boundary as
   # positional arguments, so quotes and substitutions in them stay literal.
@@ -131,11 +175,6 @@ if [[ "$dry_run" == "1" ]]; then
   printf '%q ' "${run_cmd[@]}"
   printf '\n'
   exit 0
-fi
-
-if [[ ! -s "$input_container" ]]; then
-  echo "找不到待扫描的 SRPM：$input_container（宿主机目录 $SRPM_SCAN_INPUT_HOST_PATH）" >&2
-  exit 2
 fi
 
 mkdir -p "$abs_output"
