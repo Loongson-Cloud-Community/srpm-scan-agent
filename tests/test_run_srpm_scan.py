@@ -4,8 +4,10 @@ import csv
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -15,27 +17,55 @@ DOCKER_STUB = """#!/usr/bin/env python3
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
+import time
 
 args = sys.argv[1:]
+with open(os.environ["TEST_DOCKER_CALLS"], "a") as calls:
+    calls.write(json.dumps(args) + "\\n")
 if args[:2] == ["rm", "-f"]:
+    if os.environ.get("TEST_REMOVE_FAIL"):
+        raise SystemExit("Docker daemon unavailable")
+    record = Path(os.environ["TEST_CONTAINER_PID"])
+    if record.exists():
+        try:
+            os.killpg(int(record.read_text()), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     raise SystemExit(0)
-if args[:2] != ["run", "--rm"]:
-    raise SystemExit("unexpected Docker invocation")
-Path(os.environ["TEST_DOCKER_ARGS"]).write_text(json.dumps(args))
-image_index = args.index(os.environ["CSMOCK_IMAGE"])
-# Exercise the actual inner shell, but never start a Docker container.
-raise SystemExit(subprocess.run(args[image_index + 1:]).returncode)
+if args[:2] == ["create", "--rm"]:
+    Path(os.environ["TEST_DOCKER_ARGS"]).write_text(json.dumps(args))
+    time.sleep(float(os.environ.get("TEST_CREATE_DELAY", "0")))
+    raise SystemExit(int(os.environ.get("TEST_CREATE_EXIT", "0")))
+if args[:2] == ["start", "--attach"]:
+    if os.environ.get("TEST_START_EXIT"):
+        raise SystemExit(int(os.environ["TEST_START_EXIT"]))
+    saved = json.loads(Path(os.environ["TEST_DOCKER_ARGS"]).read_text())
+    image_index = saved.index(os.environ["CSMOCK_IMAGE"])
+    # Exercise the actual inner shell in an isolated group, not a real container.
+    child = subprocess.Popen(saved[image_index + 1:], start_new_session=True)
+    Path(os.environ["TEST_CONTAINER_PID"]).write_text(str(child.pid))
+    status = child.wait()
+    raise SystemExit(status if status >= 0 else 128 - status)
+raise SystemExit("unexpected Docker invocation")
 """
 
 CSMOCK_STUB = """#!/usr/bin/env python3
 import json
 import os
 from pathlib import Path
+import signal
 import sys
+import time
 
 Path(os.environ["TEST_CSMOCK_ARGS"]).write_text(json.dumps(sys.argv[1:]))
+if os.environ.get("TEST_BLOCK_SCAN"):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    Path(os.environ["TEST_SCANNER_PID"]).write_text(str(os.getpid()))
+    while True:
+        time.sleep(0.05)
 raise SystemExit(int(os.environ.get("TEST_SCANNER_EXIT", "0")))
 """
 
@@ -75,9 +105,48 @@ class RunSrpmScanTests(unittest.TestCase):
             "CSMOCK_TOOLS": "cppcheck,clang,gcc,shellcheck",
             "BUILD_NUMBER": "7",
             "TEST_DOCKER_ARGS": str(self.root / "docker.json"),
+            "TEST_DOCKER_CALLS": str(self.root / "calls.jsonl"),
+            "TEST_CONTAINER_PID": str(self.root / "container.pid"),
+            "TEST_SCANNER_PID": str(self.root / "scanner.pid"),
             "TEST_CSMOCK_ARGS": str(self.root / "csmock.json"),
             "TEST_SUDO_ARGS": str(self.root / "sudo.json"),
         }
+        self.process = None
+        self.addCleanup(self.stop_remaining)
+
+    def stop_remaining(self):
+        record = self.root / "container.pid"
+        if record.exists():
+            try:
+                os.killpg(int(record.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if self.process:
+            if self.process.poll() is None:
+                self.process.kill()
+            self.process.communicate(timeout=3)
+
+    def start(self, **env):
+        source = Path("/scan-input/curl.src.rpm")
+        source.write_bytes(b"test RPM input")
+        self.addCleanup(source.unlink, missing_ok=True)
+        self.process = subprocess.Popen(
+            ["bash", str(SCRIPT), source.name, "artifacts"], cwd=self.workdir,
+            env={**self.env, **env}, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True,
+        )
+        return self.process
+
+    def wait_for(self, filename):
+        path = self.root / filename
+        deadline = time.monotonic() + 5
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(path.exists(), f"worker did not reach {filename}")
+        return path
+
+    def calls(self):
+        return [json.loads(line) for line in (self.root / "calls.jsonl").read_text().splitlines()]
 
     def invoke(self, name="curl-8.4.0-9.ocs23.src.rpm", output="artifacts", *, dry_run=False, input_exists=True, **env):
         if input_exists and "/" not in name and name.endswith(".src.rpm"):
@@ -344,6 +413,56 @@ class RunSrpmScanTests(unittest.TestCase):
         self.assertEqual(first_source, "/host/agent workspace/workspace/scan job/artifacts/first")
         self.assertEqual(second_source, "/host/agent workspace/workspace/scan job/artifacts/second")
         self.assertNotEqual(first_source, second_source)
+
+    def test_term_removes_only_the_current_container(self):
+        proc = self.start(TEST_BLOCK_SCAN="1")
+        scanner = self.wait_for("scanner.pid")
+        proc.send_signal(signal.SIGTERM)
+        stdout, stderr = proc.communicate(timeout=5)
+        self.assertEqual(proc.returncode, 143, stderr)
+        self.assertNotIn("SRPM 扫描产物：", stdout)
+        args = self.read_args("docker")
+        name = args[args.index("--name") + 1]
+        self.assertEqual(self.calls()[-1], ["rm", "-f", name])
+        deadline = time.monotonic() + 2
+        while Path(f"/proc/{scanner.read_text()}").exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(Path(f"/proc/{scanner.read_text()}").exists())
+
+    def test_int_returns_130_instead_of_success(self):
+        proc = self.start(TEST_BLOCK_SCAN="1")
+        self.wait_for("scanner.pid")
+        proc.send_signal(signal.SIGINT)
+        stdout, stderr = proc.communicate(timeout=5)
+        self.assertEqual(proc.returncode, 130, stderr)
+        self.assertNotIn("SRPM 扫描产物：", stdout)
+        self.assertEqual(self.calls()[-1][:2], ["rm", "-f"])
+
+    def test_cancel_during_create_cleans_up_without_starting(self):
+        proc = self.start(TEST_CREATE_DELAY="0.4")
+        self.wait_for("docker.json")
+        proc.send_signal(signal.SIGTERM)
+        proc.communicate(timeout=5)
+        self.assertEqual(proc.returncode, 143)
+        self.assertEqual([call[0] for call in self.calls()], ["create", "rm"])
+        self.assertFalse((self.root / "csmock.json").exists())
+
+    def test_failed_create_does_not_remove_an_unowned_container(self):
+        result = self.invoke(TEST_CREATE_EXIT="125")
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertEqual([call[0] for call in self.calls()], ["create"])
+
+    def test_failed_start_is_cleaned_up_and_not_reported_as_success(self):
+        result = self.invoke(TEST_START_EXIT="125")
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertEqual(self.calls()[-1][:2], ["rm", "-f"])
+        self.assertNotIn("SRPM 扫描产物：", result.stdout)
+
+    def test_cleanup_error_is_visible_and_preserves_scan_failure(self):
+        result = self.invoke(TEST_SCANNER_EXIT="17", TEST_REMOVE_FAIL="1")
+        self.assertEqual(result.returncode, 17)
+        self.assertIn("无法清理扫描容器", result.stderr)
+        self.assertIn("Docker daemon unavailable", result.stderr)
 
 
 if __name__ == "__main__":

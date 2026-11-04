@@ -148,8 +148,8 @@ fi
 # 容器名带上构建号与 PID：不同扫描（含同名 SRPM 的并发扫描）互不冲突
 container_name="csmock-$(printf '%s' "$nvr" | tr -c 'a-zA-Z0-9_.-' '-')-${BUILD_NUMBER:-manual}-$$"
 
-run_cmd=(
-  docker run --rm
+create_cmd=(
+  docker create --rm --init
   --name "$container_name"
   --cap-add=SYS_ADMIN
   --group-add "$(id -g)"
@@ -170,9 +170,12 @@ run_cmd=(
   ' run-srpm-scan "$MOCK_CONFIG" "$container_output/$nvr.tar.xz" \
     "/input/$srpm_name" "$container_output" "$(id -u):$(id -g)" "${csmock_tools_opt[@]}"
 )
+start_cmd=(docker start --attach "$container_name")
 
 if [[ "$dry_run" == "1" ]]; then
-  printf '%q ' "${run_cmd[@]}"
+  printf '%q ' "${create_cmd[@]}"
+  printf '> /dev/null && '
+  printf '%q ' "${start_cmd[@]}"
   printf '\n'
   exit 0
 fi
@@ -182,9 +185,56 @@ mkdir -p "$abs_output"
 # 组可写并带 setgid，配合上面的 --group-add 让 builder 能写入。
 chmod 2775 "$abs_output"
 
-# 中断（含 Jenkins 中止构建）时清理可能残留的一次性容器
-trap 'docker rm -f "$container_name" >/dev/null 2>&1 || true' EXIT INT TERM
+# Separate creation from attachment: cancellation cannot remove a container
+# before a background docker run has created it, then leave that container alive.
+created=0
+creating=0
+cancelled=0
+attach_pid=""
+cleanup() {
+  local status=$? message
+  trap '' INT TERM
+  if [[ "$created" == "1" ]]; then
+    # Cleanup-only bound; normal scan execution has no time limit.
+    if ! message=$(timeout --signal=KILL 10 docker rm -f "$container_name" 2>&1); then
+      if [[ "$message" != *"No such container:"* ]]; then
+        echo "无法清理扫描容器 $container_name：${message:-清理命令超时}" >&2
+      fi
+    fi
+  fi
+  if [[ -n "$attach_pid" ]]; then
+    kill -KILL "$attach_pid" 2>/dev/null || true
+    wait "$attach_pid" 2>/dev/null || true
+  fi
+  return "$status"
+}
+cancel() {
+  if [[ "$cancelled" == "0" ]]; then cancelled=$1; fi
+  # Bash defers traps while a foreground command runs. During create, finish
+  # recording ownership before exiting; never remove a name we failed to create.
+  if [[ "$creating" == "0" ]]; then exit "$cancelled"; fi
+}
+trap cleanup EXIT
+trap 'cancel 130' INT
+trap 'cancel 143' TERM
 
-"${run_cmd[@]}"
+creating=1
+if "${create_cmd[@]}" >/dev/null; then
+  created=1
+  create_status=0
+else
+  create_status=$?
+fi
+creating=0
+if [[ "$cancelled" != "0" ]]; then exit "$cancelled"; fi
+if [[ "$create_status" != "0" ]]; then exit "$create_status"; fi
+
+# wait is interruptible by shell traps, unlike a foreground docker attachment.
+"${start_cmd[@]}" &
+attach_pid=$!
+scan_status=0
+wait "$attach_pid" || scan_status=$?
+attach_pid=""
+if [[ "$scan_status" != "0" ]]; then exit "$scan_status"; fi
 
 echo "SRPM 扫描产物：$host_output/$nvr.tar.xz"
