@@ -1,5 +1,6 @@
 FROM lcr.loongnix.cn/loongnix-server/loongnix-server:23.3
 RUN sed -i '/\[updates\]/,/enabled=/ s/enabled=1/enabled=0/' /etc/yum.repos.d/Loongnix-Server.repo
+RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 
 ARG JENKINS_AGENT_JAR_URL
 
