@@ -11,7 +11,7 @@
 # 用法：
 #   run-srpm-scan SRPM_NAME [OUTPUT_DIR]
 #     SRPM_NAME   待扫描的 .src.rpm 文件名
-#     OUTPUT_DIR  当前 Jenkins 工作区内的输出子目录，默认 srpm-scan-artifacts
+#     OUTPUT_DIR  agent 工作目录内的输出子目录，默认 srpm-scan-artifacts
 #   run-srpm-scan --dry-run SRPM_NAME [OUTPUT_DIR]
 #     只打印将要执行的 docker 命令，不做任何实际操作
 #
@@ -82,14 +82,6 @@ for host_path in "$SRPM_SCAN_INPUT_HOST_PATH" "$SRPM_SCAN_AGENT_WORKSPACE_HOST_P
 done
 
 agent_workdir=$(realpath -m -- "${JENKINS_AGENT_WORKDIR:-/home/jenkins/agent}")
-workspace=$(realpath -m -- "${WORKSPACE:-$PWD}")
-case "$workspace" in
-  "$agent_workdir"|"$agent_workdir"/*) ;;
-  *)
-    echo "当前 Jenkins 工作区必须位于 agent 工作目录 $agent_workdir 内" >&2
-    exit 2
-    ;;
-esac
 input_container_dir="/scan-input"
 
 nvr=${srpm_name%.src.rpm}
@@ -104,11 +96,11 @@ if [[ "$output_dir" =~ [[:cntrl:]] ]]; then
 fi
 abs_output=$(realpath -m -- "$output_dir")
 case "$abs_output" in
-  "$workspace"/*)
+  "$agent_workdir"/*)
     relative_output="${abs_output#"$agent_workdir"/}"
     ;;
   *)
-    echo "输出目录必须为当前 Jenkins 工作区 $workspace 内的子目录：$output_dir" >&2
+    echo "输出目录必须位于 agent 工作目录 $agent_workdir 内：$output_dir" >&2
     exit 2
     ;;
 esac

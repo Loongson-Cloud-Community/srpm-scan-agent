@@ -340,36 +340,41 @@ class RunSrpmScanTests(unittest.TestCase):
         self.assertEqual(mounts[0]["target"], f"/input/{name}")
         self.assertEqual(mounts[1]["target"], "/output")
 
-    def test_unset_workspace_falls_back_to_current_directory(self):
+    def test_relative_output_works_without_workspace_context(self):
         result = self.invoke(WORKSPACE="")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.bind_mounts()[1]["source"],
                          "/host/agent workspace/workspace/scan job/artifacts")
 
-    def test_workspace_cannot_escape_agent_root(self):
+    def test_workspace_variable_does_not_constrain_the_tool(self):
         result = self.invoke(WORKSPACE=str(self.root / "outside"))
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertFalse((self.root / "docker.json").exists())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.bind_mounts()[1]["source"],
+                         "/host/agent workspace/workspace/scan job/artifacts")
 
     def test_control_characters_in_output_path_are_rejected(self):
         result = self.invoke(output="artifacts\nother")
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertFalse((self.root / "docker.json").exists())
 
-    def test_output_cannot_be_another_jobs_directory(self):
+    def test_explicit_output_can_use_another_agent_subdirectory(self):
         outside = self.root / "agent" / "workspace" / "other job" / "artifacts"
         result = self.invoke(output=str(outside))
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertFalse((self.root / "docker.json").exists())
-        self.assertFalse(outside.exists())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(outside.exists())
+        self.assertEqual(self.bind_mounts()[1], {
+            "type": "bind", "source": "/host/agent workspace/workspace/other job/artifacts",
+            "target": "/output",
+        })
 
-    def test_entire_current_workspace_cannot_be_the_output(self):
+    def test_current_directory_can_be_the_output_inside_agent_root(self):
         result = self.invoke(output=".")
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertFalse((self.root / "docker.json").exists())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.bind_mounts()[1]["source"],
+                         "/host/agent workspace/workspace/scan job")
 
-    def test_output_symlink_cannot_escape_current_workspace(self):
-        outside = self.root / "agent" / "workspace" / "other job"
+    def test_output_symlink_cannot_escape_agent_root(self):
+        outside = self.root / "outside-agent"
         outside.mkdir()
         (self.workdir / "link").symlink_to(outside, target_is_directory=True)
         result = self.invoke(output="link/artifacts")
