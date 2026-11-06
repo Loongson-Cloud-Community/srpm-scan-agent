@@ -39,10 +39,13 @@ RUN groupadd --gid ${AGENT_GID} jenkins && \
     mkdir -p /home/jenkins/agent && \
     chown -R jenkins:jenkins /home/jenkins
 
-COPY scripts/run-srpm-scan /usr/local/bin/run-srpm-scan
-COPY scripts/send-srpm-event /usr/local/bin/send-srpm-event
-COPY libexec/srpm-scan-agent/event_outbox.py /usr/local/libexec/srpm-scan-agent/event_outbox.py
-COPY scripts/jenkins-agent-entrypoint /usr/local/bin/jenkins-agent-entrypoint
+COPY agent-common /tmp/agent-common
+# Event commands use the system interpreter, independent of the scanner venv.
+RUN /usr/bin/python3 /tmp/agent-common/install.py && rm -rf /tmp/agent-common
+
+COPY srpm-scan-agent/scripts/run-srpm-scan /usr/local/bin/run-srpm-scan
+COPY srpm-scan-agent/scripts/send-srpm-event /usr/local/bin/send-srpm-event
+COPY srpm-scan-agent/scripts/jenkins-agent-entrypoint /usr/local/bin/jenkins-agent-entrypoint
 
 RUN chmod 0755 \
       /usr/local/bin/run-srpm-scan \

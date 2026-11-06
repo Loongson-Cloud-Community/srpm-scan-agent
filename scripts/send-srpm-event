@@ -1,21 +1,13 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
+"""SRPM event fields; transport and recovery use the shared client."""
+
 import argparse
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
-from http.client import HTTPException
 import json
 import os
-from pathlib import Path
-import sqlite3
 import sys
-import time
-from urllib.error import HTTPError
-from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
 
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "libexec/srpm-scan-agent"))
-from event_outbox import EventOutbox
+from scan_agent_events.delivery import deliver_event
 
 
 def parse_args():
@@ -30,73 +22,6 @@ def parse_args():
             if getattr(args, name) is None:
                 parser.error(f"--{name.replace('_', '-')} is required")
     return args
-
-
-def retry_delay(value, fallback):
-    if not value:
-        return fallback
-    try:
-        delay = int(value)
-        return delay if delay >= 0 else fallback
-    except ValueError:
-        try:
-            retry_at = parsedate_to_datetime(value)
-            if retry_at.tzinfo is None:
-                retry_at = retry_at.replace(tzinfo=timezone.utc)
-            return max(0, (retry_at - datetime.now(timezone.utc)).total_seconds())
-        except (TypeError, ValueError, OverflowError):
-            return fallback
-
-
-def send_event(request):
-    # Freeze the payload (including its event time) before entering this loop.
-    # A lost acknowledgement must resend the same event, not create a new fact.
-    max_attempts = 3
-    for attempt in range(1, max_attempts + 1):
-        retry_after = None
-        try:
-            with urlopen(request, timeout=30) as response:
-                body = response.read().decode("utf-8", errors="replace")
-            try:
-                confirmation = json.loads(body)
-            except ValueError:
-                confirmation = None
-            if (not isinstance(confirmation, dict)
-                    or type(confirmation.get("id")) is not int
-                    or confirmation["id"] <= 0):
-                print("Scan Results Portal returned no valid task acknowledgement", file=sys.stderr)
-                return 1
-            print(body)
-            return 0
-        except HTTPError as error:
-            retry_after = error.headers.get("Retry-After") if error.headers else None
-            try:
-                with error:
-                    body = error.read(4096).decode("utf-8", errors="replace")
-            except (OSError, HTTPException) as read_error:
-                body = f"Unable to read error response: {read_error}"
-            failure = f"Scan Results Portal rejected event (HTTP {error.code}): {body}"
-            status = 22
-            if error.code not in (408, 429, 500, 502, 503, 504):
-                print(failure, file=sys.stderr)
-                return status
-        except (OSError, HTTPException) as error:
-            # Includes urllib network failures, socket timeouts and truncated
-            # responses after the Portal may already have accepted the event.
-            failure = f"Unable to contact Scan Results Portal: {error}"
-            status = 1
-
-        if attempt == max_attempts:
-            print(failure, file=sys.stderr)
-            return status
-        delay = retry_delay(retry_after, attempt)
-        if delay > 30:
-            # Do not stall an agent or violate the server's requested delay.
-            # Report failure; the durable outbox retains the event for replay.
-            print(f"{failure}; Retry-After exceeds the retry window", file=sys.stderr)
-            return status
-        print(f"{failure}; retry {attempt + 1}/{max_attempts} in {delay:g}s", file=sys.stderr)
-        time.sleep(delay)
 
 
 def event_body(args):
@@ -116,49 +41,9 @@ def event_body(args):
 
 def main():
     args = parse_args()
-    portal_url = os.environ["SCAN_RESULTS_PORTAL_URL"].rstrip("/")
-    token = os.environ["SCAN_SERVICE_INGEST_TOKEN"]
-    parsed = urlsplit(portal_url)
-    # Only destinations, never credentials, may enter the recovery database.
-    if (parsed.scheme not in ("http", "https") or not parsed.netloc
-            or parsed.username is not None or parsed.password is not None
-            or parsed.query or parsed.fragment):
-        print("SCAN_RESULTS_PORTAL_URL must be an HTTP(S) base URL without credentials, query or fragment",
-              file=sys.stderr)
-        return 1
-    endpoint = f"{portal_url}/api/v1/srpm/events"
-    workdir = os.environ.get("JENKINS_AGENT_WORKDIR", "/home/jenkins/agent")
-    try:
-        with EventOutbox(workdir, "srpm") as outbox:
-            if args.event == "replay":
-                pending = outbox.pending(endpoint)
-            else:
-                body = event_body(args)
-                pending = [(outbox.store(endpoint, body), body)]
-            status = 0
-            delivered = 0
-            for event_id, body in pending:
-                outbox.attempted(event_id)
-                request = Request(
-                    endpoint, data=body, method="POST",
-                    headers={"Authorization": f"Bearer {token}",
-                             "Content-Type": "application/json"},
-                )
-                result = send_event(request)
-                if result == 0:
-                    outbox.acknowledge(event_id)
-                    delivered += 1
-                else:
-                    status = status or result
-                    print(f"Event {event_id} retained in outbox; retry with send-srpm-event replay",
-                          file=sys.stderr)
-            if args.event == "replay":
-                print(f"Replayed {delivered}/{len(pending)} events; "
-                      f"{outbox.count(endpoint)} pending for this Portal")
-            return status
-    except (OSError, sqlite3.Error) as error:
-        print(f"Unable to use event outbox: {error}", file=sys.stderr)
-        return 1
+    if args.event == "replay":
+        return deliver_event("srpm")
+    return deliver_event("srpm", lambda: event_body(args))
 
 
 if __name__ == "__main__":
