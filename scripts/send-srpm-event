@@ -5,19 +5,31 @@ from email.utils import parsedate_to_datetime
 from http.client import HTTPException
 import json
 import os
+from pathlib import Path
+import sqlite3
 import sys
 import time
 from urllib.error import HTTPError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "libexec/srpm-scan-agent"))
+from event_outbox import EventOutbox
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("event", choices=("started", "completed", "failed"))
-    parser.add_argument("--srpm-name", required=True)
+    parser.add_argument("event", choices=("started", "completed", "failed", "replay"))
+    parser.add_argument("--srpm-name")
     parser.add_argument("--event-time")
     parser.add_argument("--csmock-exit-code", type=int)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.event != "replay":
+        for name in ("srpm_name",):
+            if getattr(args, name) is None:
+                parser.error(f"--{name.replace('_', '-')} is required")
+    return args
 
 
 def retry_delay(value, fallback):
@@ -45,6 +57,15 @@ def send_event(request):
         try:
             with urlopen(request, timeout=30) as response:
                 body = response.read().decode("utf-8", errors="replace")
+            try:
+                confirmation = json.loads(body)
+            except ValueError:
+                confirmation = None
+            if (not isinstance(confirmation, dict)
+                    or type(confirmation.get("id")) is not int
+                    or confirmation["id"] <= 0):
+                print("Scan Results Portal returned no valid task acknowledgement", file=sys.stderr)
+                return 1
             print(body)
             return 0
         except HTTPError as error:
@@ -71,17 +92,14 @@ def send_event(request):
         delay = retry_delay(retry_after, attempt)
         if delay > 30:
             # Do not stall an agent or violate the server's requested delay.
-            # Report failure to the caller; no durable delivery is implied.
+            # Report failure; the durable outbox retains the event for replay.
             print(f"{failure}; Retry-After exceeds the retry window", file=sys.stderr)
             return status
         print(f"{failure}; retry {attempt + 1}/{max_attempts} in {delay:g}s", file=sys.stderr)
         time.sleep(delay)
 
 
-def main():
-    args = parse_args()
-    portal_url = os.environ["SCAN_RESULTS_PORTAL_URL"].rstrip("/")
-    token = os.environ["SCAN_SERVICE_INGEST_TOKEN"]
+def event_body(args):
     event_time = args.event_time or datetime.now(timezone.utc).isoformat()
     payload = {
         "event": args.event,
@@ -93,16 +111,54 @@ def main():
     if args.csmock_exit_code is not None:
         payload["csmock_exit_code"] = args.csmock_exit_code
 
-    request = Request(
-        f"{portal_url}/api/v1/srpm/events",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    return send_event(request)
+    return json.dumps(payload).encode("utf-8")
+
+
+def main():
+    args = parse_args()
+    portal_url = os.environ["SCAN_RESULTS_PORTAL_URL"].rstrip("/")
+    token = os.environ["SCAN_SERVICE_INGEST_TOKEN"]
+    parsed = urlsplit(portal_url)
+    # Only destinations, never credentials, may enter the recovery database.
+    if (parsed.scheme not in ("http", "https") or not parsed.netloc
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment):
+        print("SCAN_RESULTS_PORTAL_URL must be an HTTP(S) base URL without credentials, query or fragment",
+              file=sys.stderr)
+        return 1
+    endpoint = f"{portal_url}/api/v1/srpm/events"
+    workdir = os.environ.get("JENKINS_AGENT_WORKDIR", "/home/jenkins/agent")
+    try:
+        with EventOutbox(workdir, "srpm") as outbox:
+            if args.event == "replay":
+                pending = outbox.pending(endpoint)
+            else:
+                body = event_body(args)
+                pending = [(outbox.store(endpoint, body), body)]
+            status = 0
+            delivered = 0
+            for event_id, body in pending:
+                outbox.attempted(event_id)
+                request = Request(
+                    endpoint, data=body, method="POST",
+                    headers={"Authorization": f"Bearer {token}",
+                             "Content-Type": "application/json"},
+                )
+                result = send_event(request)
+                if result == 0:
+                    outbox.acknowledge(event_id)
+                    delivered += 1
+                else:
+                    status = status or result
+                    print(f"Event {event_id} retained in outbox; retry with send-srpm-event replay",
+                          file=sys.stderr)
+            if args.event == "replay":
+                print(f"Replayed {delivered}/{len(pending)} events; "
+                      f"{outbox.count(endpoint)} pending for this Portal")
+            return status
+    except (OSError, sqlite3.Error) as error:
+        print(f"Unable to use event outbox: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

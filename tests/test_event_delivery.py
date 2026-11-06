@@ -13,6 +13,7 @@ import runpy
 import socket
 import sys
 import threading
+import tempfile
 import unittest
 from unittest.mock import Mock, call, patch
 from urllib.error import HTTPError, URLError
@@ -35,7 +36,10 @@ class FailedRead(io.BytesIO):
 class EventDeliveryTests(unittest.TestCase):
     def setUp(self):
         self.main = runpy.run_path(str(COMMAND))["main"]
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
         self.env = {
+            "JENKINS_AGENT_WORKDIR": directory.name,
             "SCAN_RESULTS_PORTAL_URL": "http://127.0.0.1:8080/",
             "SCAN_SERVICE_INGEST_TOKEN": "test-only-secret",
             "BUILD_NUMBER": "7", "JOB_NAME": "folder/package",
@@ -83,7 +87,7 @@ class EventDeliveryTests(unittest.TestCase):
 
     def test_transient_http_failure_retries_the_identical_event(self):
         failure = self.error(503)
-        success = io.BytesIO(b"ok")
+        success = io.BytesIO(b'{"id":1,"message":"ok"}')
         opener = Mock(side_effect=[failure, success])
         status, stdout, stderr, sleep = self.run_main(opener, event="completed")
         self.assertEqual(status, 0)
@@ -101,7 +105,7 @@ class EventDeliveryTests(unittest.TestCase):
     def test_retryable_http_statuses(self):
         for code in (408, 429, 500, 502, 503, 504):
             with self.subTest(code=code):
-                opener = Mock(side_effect=[self.error(code), io.BytesIO(b"ok")])
+                opener = Mock(side_effect=[self.error(code), io.BytesIO(b'{"id":1}')])
                 status, _, _, _ = self.run_main(opener)
                 self.assertEqual(status, 0)
                 self.assertEqual(opener.call_count, 2)
@@ -138,28 +142,28 @@ class EventDeliveryTests(unittest.TestCase):
         self.assertIn("503", stderr)
 
     def test_direct_socket_timeout_can_recover(self):
-        opener = Mock(side_effect=[TimeoutError("socket timeout"), io.BytesIO(b"ok")])
+        opener = Mock(side_effect=[TimeoutError("socket timeout"), io.BytesIO(b'{"id":1}')])
         status, _, _, _ = self.run_main(opener)
         self.assertEqual(status, 0)
         self.assertEqual(opener.call_count, 2)
 
     def test_response_read_failure_retries_and_closes_the_first_response(self):
         failed = FailedRead()
-        opener = Mock(side_effect=[failed, io.BytesIO(b"ok")])
+        opener = Mock(side_effect=[failed, io.BytesIO(b'{"id":1}')])
         status, _, _, _ = self.run_main(opener)
         self.assertEqual(status, 0)
         self.assertTrue(failed.closed)
         self.assertEqual(opener.call_count, 2)
 
     def test_retry_after_seconds_is_respected(self):
-        opener = Mock(side_effect=[self.error(429, {"Retry-After": "5"}), io.BytesIO(b"ok")])
+        opener = Mock(side_effect=[self.error(429, {"Retry-After": "5"}), io.BytesIO(b'{"id":1}')])
         status, _, _, sleep = self.run_main(opener)
         self.assertEqual(status, 0)
         sleep.assert_called_once_with(5)
 
     def test_truncated_response_is_retried_and_closed(self):
         failed = FailedRead(IncompleteRead(b"partial", 20))
-        opener = Mock(side_effect=[failed, io.BytesIO(b"ok")])
+        opener = Mock(side_effect=[failed, io.BytesIO(b'{"id":1}')])
         status, _, _, _ = self.run_main(opener)
         self.assertEqual(status, 0)
         self.assertTrue(failed.closed)
@@ -177,7 +181,7 @@ class EventDeliveryTests(unittest.TestCase):
         self.assertIn("HTTP 403", stderr)
 
     def test_failed_event_keeps_scanner_exit_code_and_time_during_retry(self):
-        opener = Mock(side_effect=[URLError("connection refused"), io.BytesIO(b"ok")])
+        opener = Mock(side_effect=[URLError("connection refused"), io.BytesIO(b'{"id":1}')])
         status, _, _, _ = self.run_main(opener, event="failed")
         self.assertEqual(status, 0)
         first, second = [item.args[0].data for item in opener.call_args_list]
@@ -190,7 +194,7 @@ class EventDeliveryTests(unittest.TestCase):
 
     def test_retry_after_http_date_is_respected(self):
         future = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=10), usegmt=True)
-        opener = Mock(side_effect=[self.error(503, {"Retry-After": future}), io.BytesIO(b"ok")])
+        opener = Mock(side_effect=[self.error(503, {"Retry-After": future}), io.BytesIO(b'{"id":1}')])
         status, _, _, sleep = self.run_main(opener)
         self.assertEqual(status, 0)
         self.assertEqual(sleep.call_count, 1)
@@ -208,7 +212,7 @@ class EventDeliveryTests(unittest.TestCase):
     def test_invalid_retry_after_uses_bounded_backoff(self):
         for value in ("not a date", "-1"):
             with self.subTest(value=value):
-                opener = Mock(side_effect=[self.error(503, {"Retry-After": value}), io.BytesIO(b"ok")])
+                opener = Mock(side_effect=[self.error(503, {"Retry-After": value}), io.BytesIO(b'{"id":1}')])
                 status, _, _, sleep = self.run_main(opener)
                 self.assertEqual(status, 0)
                 sleep.assert_called_once_with(1)

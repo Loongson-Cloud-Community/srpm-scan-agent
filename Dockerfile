@@ -41,6 +41,7 @@ RUN groupadd --gid ${AGENT_GID} jenkins && \
 
 COPY scripts/run-srpm-scan /usr/local/bin/run-srpm-scan
 COPY scripts/send-srpm-event /usr/local/bin/send-srpm-event
+COPY libexec/srpm-scan-agent/event_outbox.py /usr/local/libexec/srpm-scan-agent/event_outbox.py
 COPY scripts/jenkins-agent-entrypoint /usr/local/bin/jenkins-agent-entrypoint
 
 RUN chmod 0755 \
